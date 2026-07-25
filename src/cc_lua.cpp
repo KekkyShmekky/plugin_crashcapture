@@ -1131,8 +1131,10 @@ namespace CrashCapture {
         const char* name = g_api.type(L, 1) == CC_LT_STR ? g_api.tolstring(L, 1, NULL) : NULL;
         const CCModule* m = name ? Modules::FindByName(name) : NULL;
         if (!m) { g_api.pushnil(L); return 1; }
-        g_api.pushlightuserdata(L, (void*)m->base);
-        g_api.pushnumber(L, (double)m->size);
+        size_t span = 0;
+        uintptr_t lb = Modules::Extent(m, &span);
+        g_api.pushlightuserdata(L, (void*)lb);
+        g_api.pushnumber(L, (double)span);
         return 2; // base, size
     }
 
@@ -1148,9 +1150,11 @@ namespace CrashCapture {
         for (int i = 0; i < count; ++i) {
             l->PushNumber((double)(i + 1));
             l->CreateTable();
+            size_t span = 0;
+            uintptr_t lb = Modules::Extent(&mods[i], &span);
             l->PushString(mods[i].name); l->SetField(-2, "name");
-            g_api.pushlightuserdata(L, (void*)mods[i].base); l->SetField(-2, "base");
-            l->PushNumber((double)mods[i].size); l->SetField(-2, "size");
+            g_api.pushlightuserdata(L, (void*)lb); l->SetField(-2, "base");
+            l->PushNumber((double)span); l->SetField(-2, "size");
             l->SetTable(-3);
         }
         return 1;

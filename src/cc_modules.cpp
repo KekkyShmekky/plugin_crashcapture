@@ -74,6 +74,7 @@ namespace CrashCapture {
 
                 CCModule& m = g_modules[g_moduleCount++];
                 m.base = (uintptr_t)e->DllBase;
+                m.loadbase = m.base;
                 m.size = (size_t)e->SizeOfImage;
                 WideToUtf8(e->BaseDllName.Buffer,
                         e->BaseDllName.Length / (int)sizeof(wchar_t),
@@ -146,6 +147,8 @@ namespace CrashCapture {
 
             // One CCModule per executable, file-backed mapping with a path
             char* line = buf;
+            char curFile[96] = {0};
+            uintptr_t curLoad = 0;
             while (line && *line && g_moduleCount < kMaxModules) {
                 char* nl = strchr(line, '\n');
                 if (nl) *nl = 0;
@@ -170,6 +173,15 @@ namespace CrashCapture {
                 bool exec = perms[2] == 'x';
                 bool filebacked = path && path[0] == '/';
 
+                if (filebacked) {
+                    char bn[96];
+                    BaseName(path, bn, sizeof(bn));
+                    if (strcmp(bn, curFile) != 0) {
+                        snprintf(curFile, sizeof(curFile), "%s", bn);
+                        curLoad = (uintptr_t)start;
+                    }
+                }
+
                 if (exec && filebacked) {
                     char base[96];
                     BaseName(path, base, sizeof(base));
@@ -184,9 +196,11 @@ namespace CrashCapture {
                         }
                         uintptr_t fend = found->base + found->size;
                         if ((uintptr_t)end > fend) found->size += (uintptr_t)end - fend;
+                        if (curLoad && curLoad < found->loadbase) found->loadbase = curLoad;
                     } else {
                         CCModule& m = g_modules[g_moduleCount++];
                         m.base = (uintptr_t)start;
+                        m.loadbase = curLoad ? curLoad : m.base;
                         m.size = (size_t)(end - start);
                         snprintf(m.name, sizeof(m.name), "%s", base);
                     }
@@ -194,6 +208,7 @@ namespace CrashCapture {
                     // Anonymous executable mapping (LuaJIT mcode etc.)
                     CCModule& m = g_modules[g_moduleCount++];
                     m.base = (uintptr_t)start;
+                    m.loadbase = m.base;
                     m.size = (size_t)(end - start);
                     snprintf(m.name, sizeof(m.name), "[anon-exec]");
                 }
@@ -240,6 +255,13 @@ namespace CrashCapture {
         return false;
     }
 
+    uintptr_t Modules::Extent(const CCModule* m, size_t* sizeOut)
+    {
+        if (!m) { if (sizeOut) *sizeOut = 0; return 0; }
+        if (sizeOut) *sizeOut = (size_t)((m->base + m->size) - m->loadbase);
+        return m->loadbase;
+    }
+
     const CCModule* Modules::Find(uintptr_t addr)
     {
         for (int i = 0; i < g_moduleCount; ++i) {
@@ -281,8 +303,7 @@ namespace CrashCapture {
         const CCModule* m = Modules::Find(addr);
         int w;
         if (m)
-            w = snprintf(out, outsz, "%s+0x%llx (0x%llx)",
-                        m->name, (unsigned long long)(addr - m->base), (unsigned long long)addr);
+            w = snprintf(out, outsz, "%s+0x%llx (0x%llx)", m->name, (unsigned long long)(addr - m->loadbase), (unsigned long long)addr);
         else if (addr && Mem::IsExecutable(addr)) // exec but no module: likely JIT mcode
             w = snprintf(out, outsz, "0x%llx <JIT mcode? (anon exec)>", (unsigned long long)addr);
         else
@@ -303,10 +324,12 @@ namespace CrashCapture {
         Log::Str("|---|---|---|---|\n");
         for (int i = 0; i < g_moduleCount; ++i) {
             const CCModule& m = g_modules[i];
+            size_t span = 0;
+            uintptr_t lb = Modules::Extent(&m, &span);
             Log::F("| `0x%llx` | `0x%llx` | %llu KB | `%s` |\n",
-                (unsigned long long)m.base,
-                (unsigned long long)(m.base + m.size),
-                (unsigned long long)(m.size / 1024), m.name);
+                (unsigned long long)lb,
+                (unsigned long long)(lb + span),
+                (unsigned long long)(span / 1024), m.name);
         }
     }
 }

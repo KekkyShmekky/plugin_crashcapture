@@ -720,15 +720,15 @@ namespace CrashCapture {
             uintptr_t pc = (uintptr_t)g[REG_EIP];
         #endif
 
-        // log where the thread is stuck (module+offset, maps to IDA via +0x2A000) so a new hang variant is diagnosable.
+        // log where the thread is stuck (module+offset, load-base relative -> pastes straight into a disassembler) so a new hang variant is diagnosable.
         {
             void* fn = _Unwind_FindEnclosingFunction((void*)pc);
             const CCModule* pm = Modules::Find(pc);
             const CCModule* fm = fn ? Modules::Find((uintptr_t)fn) : NULL;
             Log::Debug("[CC-PHYS]   stuck PC=0x%lx (%s+0x%lx), enclosing fn=%s+0x%lx\n",
                         (unsigned long)pc,
-                        pm ? pm->name : "?", (unsigned long)(pm ? pc - pm->base : 0UL),
-                        fm ? fm->name : "?", (unsigned long)((fm && fn) ? (uintptr_t)fn - fm->base : 0UL));
+                        pm ? pm->name : "?", (unsigned long)(pm ? pc - pm->loadbase : 0UL),
+                        fm ? fm->name : "?", (unsigned long)((fm && fn) ? (uintptr_t)fn - fm->loadbase : 0UL));
         }
 
         // resolve physenv's time-event queue (its min_hash) so we can reset it below.

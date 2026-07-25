@@ -109,6 +109,7 @@ namespace CrashCapture {
     // --------- cc-modules ---
     struct CCModule {
         uintptr_t base;
+        uintptr_t loadbase;
         size_t size;
         char name[96]; // basename only
     };
@@ -123,6 +124,7 @@ namespace CrashCapture {
     namespace Modules {
         int  Refresh();
         bool HasLua();
+        uintptr_t Extent(const CCModule* m, size_t* sizeOut);
         const CCModule* Find(uintptr_t addr);
         const CCModule* FindByName(const char* needle);
         int  Snapshot(const CCModule** out);

@@ -199,8 +199,10 @@ namespace CrashCapture {
         const char* name = A.tolstring(L, 1, NULL);
         const CCModule* m = name ? Modules::FindByName(name) : NULL;
         if (!m) { A.pushnil(L); return 1; }
-        A.pushlightuserdata(L, (void*)m->base);
-        A.pushnumber(L, (double)m->size);
+        size_t span = 0;
+        uintptr_t lb = Modules::Extent(m, &span);
+        A.pushlightuserdata(L, (void*)lb);
+        A.pushnumber(L, (double)span);
         return 2; // base, size
     }
 
@@ -210,10 +212,12 @@ namespace CrashCapture {
         int count = Modules::Snapshot(&mods);
         A.createtable(L, count, 0);
         for (int i = 0; i < count; ++i) {
+            size_t span = 0;
+            uintptr_t lb = Modules::Extent(&mods[i], &span);
             A.createtable(L, 0, 3);
             A.pushstring(L, mods[i].name); A.setfield(L, -2, "name");
-            A.pushlightuserdata(L, (void*)mods[i].base); A.setfield(L, -2, "base");
-            A.pushnumber(L, (double)mods[i].size);A.setfield(L, -2, "size");
+            A.pushlightuserdata(L, (void*)lb); A.setfield(L, -2, "base");
+            A.pushnumber(L, (double)span);A.setfield(L, -2, "size");
             A.rawseti(L, -2, i + 1);
         }
         return 1;
