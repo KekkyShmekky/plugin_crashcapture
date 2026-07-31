@@ -182,7 +182,7 @@ namespace CrashCapture {
     // --------- cc-recovery ---
     namespace Recovery {
         void NotePhysResume(const char* stall, const char* report);
-        void NotePhysResolve(const int* ents, int n, const char* report);
+        void NotePhysResolve(const int* ents, int n, const char* report, uint64_t downtimeMs);
         void NoteRecovered(const char* method, uint64_t downtimeMs, const char* stall, const char* reason, const char* report);
     }
 
@@ -193,6 +193,7 @@ namespace CrashCapture {
             bool Install();
             void Uninstall();
             uint64_t LagEpisodes();
+            uint64_t LastLagTickMs();
         }
     }
 

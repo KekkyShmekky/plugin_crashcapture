@@ -60,7 +60,15 @@ The defaults are sensible, so you only need these if you want to change somethin
 | `CRASHCAPTURE_LOOPBREAK` | `1` | On a freeze, if the stalled thread is in Lua, arms a Lua debug hook on every realm that raises an error to break out of a stuck loop. |
 | `CRASHCAPTURE_PHYS_RESUME` | `1` | Linux only, when a fatal fault happens inside the physics tick (`PhysFrame`, under `Host_RunFrame`), pause physics and resume the game thread as if the physics call returned. |
 | `CRASHCAPTURE_PHYS_HOOK` | `1` | Linux only, prevents runaway physics hangs at the source instead of just reporting them. |
-| `CRASHCAPTURE_PHYS_HOOK_MS` | `250` | per-tick budget, in milliseconds, before the hook above steps in. |
+| `CRASHCAPTURE_PHYS_HOOK_MS` | `250` | per-tick budget, in milliseconds, before the hook above steps in. Clamped to a minimum of `20`. |
+| `CRASHCAPTURE_PHYS_RECOVER` | `1` | Linux only, after a physics stall, freeze the offending objects so the tick can finish instead of stalling again. |
+| `CRASHCAPTURE_PHYS_PIN` | `0` | Linux only, also pin the offending objects in place (motion disabled) rather than only reporting them. |
+| `CRASHCAPTURE_PHYS_RESOLVE_DELAY` | `3` | Linux only, frames to wait after a physics recovery before firing the `crashcapture.physresolve` hook, so physics has settled. |
+| `CRASHCAPTURE_REPORT_DEBOUNCE` | `15` | Minimum seconds between repeat reports for the same recurring condition. `0` disables the debounce. |
+| `CRASHCAPTURE_ENGINE_ERROR` | `1` | Capture engine-side fatal errors (`Sys_Error` and friends) instead of letting them exit silently. |
+| `CRASHCAPTURE_FRAME_PROFILE` | `1` | Collect per-frame timing metrics (what `crashcapture.frametime()` returns). |
+| `CRASHCAPTURE_DEBUG` | `0` | Verbose internal tracing. Noisy, for troubleshooting the plugin itself. |
+| `CRASHCAPTURE_MEMAPI` | `0` | Expose the `mem.*` API to Lua. Unsafe, see the warning below. |
 | `CRASHCAPTURE_WINDOW_WATCHDOG` | `1` | On Windows clients with no other heartbeat, detect a frozen game by watching its window. |
 | `CRASHCAPTURE_LUA_HEARTBEAT` | `1` | Use a lightweight in-game timer as the freeze heartbeat. |
 | `CRASHCAPTURE_MANUAL_DUMP` | `1` | Let an external process force a report on demand. |
@@ -97,7 +105,10 @@ crashcapture.frametime() -- returns a table of timing metrics
 > `crashcapture.get("ready")` (see [Knowing when it's ready](#knowing-when-its-ready)).
 
 Keys mirror the settings above, lower-cased and without the `CRASHCAPTURE_`
-prefix: `timeout`, `hang_kill`, `max_age_days`, `loopbreak`, `phys_resume`, `phys_recover`, `phys_pin`, `phys_resolve_delay`, `debug`, `report_debounce`, `firstchance`, `window_watchdog`, `lua_heartbeat`, `manual_dump`, `symbols`, `dir`, `script`, and `disable`.
+prefix: `timeout`, `hang_kill`, `max_age_days`, `loopbreak`, `phys_resume`, `phys_recover`, `phys_pin`, `phys_hook_ms`, `phys_resolve_delay`, `debug`, `engine_error`, `frame_profile`, `report_debounce`, `firstchance`, `window_watchdog`, `lua_heartbeat`, `manual_dump`, `symbols`, and `disable`.
+
+`dir`, `script`, `memapi` and `phys_hook` are launch-config only: `get` reads them, `set` is refused (they're decided before Lua exists, and `memapi` would be a way to grant itself the unsafe `mem.*` API).\
+`console` is not exposed to Lua at all.
 
 There's also a Linux-only diagnostic for the physics-resume feature:
 > This is deprecate due to the existing `physenv.SetPhysicsPaused( boolean pause )`
@@ -111,8 +122,8 @@ crashcapture.phys_pause(false) -- resume
 - Raising `timeout` from `0` starts the watchdog, enabling `lua_heartbeat`
   installs the heartbeat timer; `set("disable", true)` disarms the plugin and
   `false` re-arms it.
-- `max_age_days`, `dir`, and `script` only matter at the next startup / next
-  crash respectively, so set them early.
+- `max_age_days` is only read at startup, so setting it from Lua only affects the next run, `dir` and `script` are launch-config only for the same reason.
+- `phys_hook_ms` applies to the next physics tick and is clamped to `20` minimum, the same as the environment variable.
 
 ## Knowing when it's ready
 

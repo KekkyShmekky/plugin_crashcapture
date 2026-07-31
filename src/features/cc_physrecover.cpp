@@ -127,7 +127,7 @@ namespace CrashCapture {
     }
 
     // &IVP_Event_Manager::mode drain loop (simulate_time_events)
-    static int* EventLoopMode()
+    int* Phys::Recover::EventLoopMode()
     {
     #if defined(CC_X86)
         uintptr_t slot = Sig::Get("phys.env_slot"); // &physenv
@@ -190,44 +190,34 @@ namespace CrashCapture {
         g_hookLagged = true;
     }
 
-    // reset a saturated/corrupt IVP_U_Min_List back to empty, this causes garbage to hit the next tick.
-    struct ResetArgs { uintptr_t mh; };
-    static void ResetMinListInner(void* arg)
+    // walk the scheduled-event chain of an IVP_U_Min_List and collect the exploding set.
+    // read-only: the queue belongs to vphysics and rewriting it corrupts its teardown.
+    struct ScanListArgs { uintptr_t mh; uint32_t count; int events; int objs; };
+    static void ScanMinListInner(void* arg)
     {
         #if defined(CC_X86)
-            uintptr_t mh = ((ResetArgs*)arg)->mh;
+            ScanListArgs* la = (ScanListArgs*)arg;
+            uintptr_t mh = la->mh;
             if (!mh || !Mem::IsReadable((void*)mh, 24)) return;
             uint32_t cap = *(uint16_t*)(mh + 0); // malloced_size (capacity)
             uintptr_t elems = *(uintptr_t*)(mh + 4); // slot array
-            uint32_t before = *(uint32_t*)(mh + 20); // live count (may exceed cap)
+            la->count = *(uint32_t*)(mh + 20); // live count (may exceed cap)
             if (!cap || !elems || !Mem::IsReadable((void*)elems, (size_t)cap * 16))
                 return;
 
-            // clear each in-use slot's mindist back-link
-            int cleared = 0;
-            for (uint32_t i = 0; i < cap; ++i) {
-                uintptr_t mindist = *(uintptr_t*)(elems + (uintptr_t)i * 16 + 12);
-                if (mindist && *(uint32_t*)(mindist + 4) == i) {
-                    *(uint32_t*)(mindist + 4) = 0xFFFF; // "no time-event slot"
-                    ++cleared;
-                    RawIvpAdd(*(uintptr_t*)(mindist + kMindistObj0)); // collect the exploding objects
-                    RawIvpAdd(*(uintptr_t*)(mindist + kMindistObj1));
-                }
+            uint32_t idx = *(uint32_t*)(mh + 16); // first_element, 0xFFFF terminates
+            for (uint32_t step = 0; step < cap && idx < cap; ++step) {
+                uintptr_t slot = elems + (uintptr_t)idx * 16;
+                uintptr_t ev = *(uintptr_t*)(slot + 12); // IVP_Time_Event*
+                idx = *(uint16_t*)(slot + 4); // next in schedule order
+                if (!ev || (ev & (sizeof(void*) - 1))) continue;
+                if (!Mem::IsReadable((void*)ev, kMindistObj1 + sizeof(void*))) continue;
+                ++la->events;
+                int before = g_nRawIvp;
+                RawIvpAdd(*(uintptr_t*)(ev + kMindistObj0)); // non-mindist events fail AsPhysObject later
+                RawIvpAdd(*(uintptr_t*)(ev + kMindistObj1));
+                la->objs += g_nRawIvp - before;
             }
-
-            // empty every slot's links + rebuild the free-list
-            for (uint32_t i = 0; i < cap; ++i) {
-                *(uint16_t*)(elems + (uintptr_t)i * 16 + 0) = 0xFFFF;                                     // long_next
-                *(uint16_t*)(elems + (uintptr_t)i * 16 + 4) = (i + 1 < cap) ? (uint16_t)(i + 1) : 0xFFFF; // free-next
-            }
-            *(uint16_t*)(mh + 2) = 0; // free_list head = slot 0
-            *(uint32_t*)(mh + 8) = 0x501802B9; // min_value = empty sentinel (as remove sets it)
-            *(uint32_t*)(mh + 12) = 0xFFFF; // first_long = none
-            *(uint32_t*)(mh + 16) = 0xFFFF; // first_element = none
-            *(uint32_t*)(mh + 20) = 0; // live count = 0
-            Log::F("[Crash Capture] phys recover: reset saturated event queue "
-                "(mh=0x%lx cap=%u, was count=%u, cleared %d mindist back-links).\n",
-                (unsigned long)mh, cap, before, cleared);
         #else
             (void)arg;
         #endif
@@ -483,9 +473,49 @@ namespace CrashCapture {
         return false;
     }
 
+    static uintptr_t PhysEnvSlot()
+    {
+        uintptr_t slot = Sig::Get("phys.env_slot");
+        return (slot && Mem::IsReadable((void*)slot, sizeof(void*))) ? slot : 0;
+    }
+
+    static void ResetForLevel()
+    {
+        if ((g_pluginPaused || g_giveUp) && Platform::PhysPaused() == 1)
+            Platform::SetPhysPaused(0);
+
+        Phys::Recover::Reset();
+        g_nRawIvp = 0;
+        g_nRepin = 0;
+        g_giveUp = false;
+        g_giveUpEnt = -1;
+        g_recWindowStart = 0;
+        g_recWindowCount = 0;
+        g_pluginPaused = false;
+        g_modeForced = false;
+        g_hookLagged = false;
+    }
+
+    static uintptr_t g_envSeen = 0;
+
     void Phys::Recover::PollGameThread()
     {
         PhysFrameStart();
+
+        uintptr_t slot = PhysEnvSlot();
+        if (slot) {
+            uintptr_t env = *(uintptr_t*)slot;
+            if (env != g_envSeen) {
+                bool held = g_nPending || g_nFrozen || g_nRawIvp || g_giveUp || g_pluginPaused;
+                ResetForLevel();
+                g_envSeen = env;
+                if (held)
+                    Log::Debug("[CC-PHYS] physenv changed (0x%lx), dropped the previous level's offender state.\n",
+                                (unsigned long)env);
+            }
+            if (!env) return;
+        }
+
         if (Cfg().phys_hook) Phys::Bind::Install();
 
         // undo the drain-loop escape from mode=1
@@ -501,21 +531,25 @@ namespace CrashCapture {
             PromoteRawOffenders();
 
             bool b_BannerDebounce = BannerDebounce();
+            uint64_t tickMs = Phys::Bind::LastLagTickMs();
             int frozen = 0;
             if (g_nPending > 0) {
                 frozen = Phys::Recover::FreezeQueued();
                 if (frozen > 0) {
-                    int ents[kMaxPhys];
-                    int nEnt = Phys::Recover::FrozenEntities(ents, kMaxPhys);
-                    if (nEnt > 0) Recovery::NotePhysResolve(ents, nEnt, NULL);
+                    if (g_nFrozenEnt > 0) {
+                        Recovery::NotePhysResolve(g_frozenEnt, g_nFrozenEnt, NULL, tickMs);
+                        g_nFrozenEnt = 0;
+                    }
                     if (!b_BannerDebounce)
-                        Log::F("[Crash Capture] runaway physics tick prevented, %d offender(s).\n", frozen);
+                        Log::F("[Crash Capture] runaway physics tick prevented after %llums, %d offender(s).\n",
+                                (unsigned long long)tickMs, frozen);
                 }
             }
-            
+
             if (b_BannerDebounce) {
                 char reason[176];
-                snprintf(reason, sizeof(reason), "vphysics mindist tick overran %dms, %d offender(s)", Cfg().phys_hook_ms, frozen);
+                snprintf(reason, sizeof(reason), "vphysics mindist tick ran %llums against a %dms budget, %d offender(s)",
+                         (unsigned long long)tickMs, Cfg().phys_hook_ms, frozen);
                 Report::Banner("hang - physics (vphysics)", reason, NULL);
             }
         }
@@ -731,7 +765,7 @@ namespace CrashCapture {
                         fm ? fm->name : "?", (unsigned long)((fm && fn) ? (uintptr_t)fn - fm->loadbase : 0UL));
         }
 
-        // resolve physenv's time-event queue (its min_hash) so we can reset it below.
+        // resolve physenv's time-event queue (its min_hash) so we can read the offenders off it.
         uintptr_t mh = 0;
         bool haveMh = MinListStats(NULL, NULL, &mh);
         static const uintptr_t kStackWindow = 0x20000; // 128 KiB above SP
@@ -739,13 +773,15 @@ namespace CrashCapture {
         if (!haveMh || !mh) {
             // no queue to blame anyone from, have to use a wide stack scan...
             Phys::Recover::MarkOffender(sp, sp + kStackWindow);
-            Log::Debug("[CC-PHYS] ResumeFromHang: could not resolve min_hash, cannot reset/escape.\n");
+            Log::Debug("[CC-PHYS] ResumeFromHang: could not resolve min_hash, cannot scan/escape.\n");
             return PHYS_NORESUME;
         }
 
-        g_nRawIvp = 0; // ResetMinListInner refills this with the exploding set from the mindists
-        ResetArgs ra; ra.mh = mh;
-        RunProtectedQuiet(ResetMinListInner, &ra);
+        g_nRawIvp = 0; // ScanMinListInner refills this with the exploding set from the mindists
+        ScanListArgs la; la.mh = mh; la.count = 0; la.events = 0; la.objs = 0;
+        RunProtectedQuiet(ScanMinListInner, &la);
+        Log::Debug("[CC-PHYS] ResumeFromHang: queue scan walked %d of %u scheduled event(s), "
+                    "%d candidate object(s).\n", la.events, la.count, la.objs);
 
         // stack sweep is only as a last resort, since it can get phys objects not related.
         if (g_nRawIvp == 0)
@@ -759,7 +795,7 @@ namespace CrashCapture {
         g_pluginPaused = true;
 
         ++g_physResumeCount;
-        Log::Debug("[CC-PHYS] ResumeFromHang: reset queue + mode=1, returning to finish the tick "
+        Log::Debug("[CC-PHYS] ResumeFromHang: mode=1, returning to finish the tick "
                     "(escape #%u; %d raw / %d pending offender(s); mh=0x%lx; mode@%p).\n",
                     g_physResumeCount, g_nRawIvp, g_nPending, (unsigned long)mh, (void*)mode);
         return PHYS_RESUMED;

@@ -25,6 +25,7 @@ namespace CrashCapture {
             int FrozenEntities(int* out, int max);
             void Reset();
             void NoteHookLag(uintptr_t mindist);
+            int* EventLoopMode();
         }
     }
 }

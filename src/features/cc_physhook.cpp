@@ -60,10 +60,10 @@ namespace CrashCapture {
     static bool g_installed = false;
 
     static thread_local uint64_t g_tickStartNs = 0;
-    static thread_local bool g_skip = false;
-    static thread_local bool g_noted = false;
+    static thread_local bool g_latched = false;
 
     static uint64_t g_lagEpisodes = 0; // diagnostics lifetime
+    static uint64_t g_lastTickMs = 0;
 
     static inline uint64_t NowNs()
     {
@@ -83,40 +83,52 @@ namespace CrashCapture {
 
     // --- the detours, oh no ---
 
+    // over budget: latch IVP's own drain-loop escape (event_manager->mode = 1).
+    static void BudgetCheck(void* mindist)
+    {
+        if (g_latched || !g_tickStartNs || ElapsedMs() <= ThresholdMs()) return;
+        int* mode = Phys::Recover::EventLoopMode();
+        if (!mode) return;
+        *mode = 1;
+        g_latched = true;
+        ++g_lagEpisodes;
+        g_lastTickMs = ElapsedMs();
+        Phys::Recover::NoteHookLag((uintptr_t)mindist); // -> offenders + one debounced report
+    }
+
     // simulate_time_events: the outer boundary of a drain.
     static void h_ste(void* em, void* tm, void* env, double time)
     {
+        uint64_t prevStart = g_tickStartNs;
+        bool prevLatched = g_latched;
         g_tickStartNs = NowNs();
-        g_skip = false;
-        g_noted = false;
+        g_latched = false;
         o_ste(em, tm, env, time);
-        g_skip = false;
+        if (g_latched) {
+            g_lastTickMs = ElapsedMs();
+            int* mode = Phys::Recover::EventLoopMode();
+            if (mode) *mode = 0;
+        }
+        g_tickStartNs = prevStart;
+        g_latched = prevLatched;
     }
 
     // update_exact_mindist_events: the source of the painful runaway rescheduling.
     static void h_ue(void* mindist, int a2, int a3)
     {
-        if (!g_skip && ElapsedMs() > ThresholdMs()) {
-            g_skip = true;
-            if (!g_noted) {
-                g_noted = true;
-                ++g_lagEpisodes;
-                Phys::Recover::NoteHookLag((uintptr_t)mindist); // -> offenders + one debounced report
-            }
-        }
-        if (g_skip) return;
+        BudgetCheck(mindist);
         o_ue(mindist, a2, a3);
     }
 
-    // do_impact / simulate_time_event: while skipping, don't resolve/reschedule either, this will break vphysics into garbage states
+    // do_impact / simulate_time_event: per-event checkpoints, the originals always run.
     static void h_di(void* mindist)
     {
-        if (g_skip) { Phys::Recover::NoteHookLag((uintptr_t)mindist); return; }
+        BudgetCheck(mindist);
         o_di(mindist);
     }
     static void h_stev(void* mindist, void* env)
     {
-        if (g_skip) { Phys::Recover::NoteHookLag((uintptr_t)mindist); return; }
+        BudgetCheck(mindist);
         o_stev(mindist, env);
     }
 
@@ -159,6 +171,7 @@ namespace CrashCapture {
     }
 
     uint64_t Phys::Bind::LagEpisodes() { return g_lagEpisodes; }
+    uint64_t Phys::Bind::LastLagTickMs() { return g_lastTickMs; }
 }
 
 #else
@@ -168,6 +181,7 @@ namespace CrashCapture {
     bool Phys::Bind::Install() { return false; }
     void Phys::Bind::Uninstall() {}
     uint64_t Phys::Bind::LagEpisodes() { return 0; }
+    uint64_t Phys::Bind::LastLagTickMs() { return 0; }
 }
 
 #endif

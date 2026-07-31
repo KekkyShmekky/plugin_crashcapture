@@ -159,7 +159,7 @@ namespace CrashCapture {
             if (Phys::Recover::Available()) {
                 int ents[32];
                 int n = Phys::Recover::FrozenEntities(ents, 32);
-                if (n > 0) Recovery::NotePhysResolve(ents, n, g_hangReportPath);
+                if (n > 0) Recovery::NotePhysResolve(ents, n, g_hangReportPath, dur);
                 Phys::Recover::Reset();
             }
         #endif

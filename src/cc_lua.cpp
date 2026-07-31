@@ -557,10 +557,10 @@ namespace CrashCapture {
         g_recRecovery = 1;
     }
 
-    void Recovery::NotePhysResolve(const int* ents, int n, const char* report)
+    void Recovery::NotePhysResolve(const int* ents, int n, const char* report, uint64_t downtimeMs)
     {
         if (n < 0) n = 0;
-        if (g_recResolveFired) { g_recInfo.entCount = 0; g_recResolveFired = 0; } // new window
+        if (g_recResolveFired) { g_recInfo.entCount = 0; g_recInfo.downtime = 0; g_recResolveFired = 0; } // new window
         int added = 0;
         for (int i = 0; i < n && g_recInfo.entCount < CC_REC_ENT_MAX; ++i) {
             int e = ents[i];
@@ -570,11 +570,12 @@ namespace CrashCapture {
             if (!dup) { g_recInfo.entities[g_recInfo.entCount++] = e; ++added; }
         }
         RecStr(g_recInfo.report, sizeof(g_recInfo.report), report);
+        if (downtimeMs > g_recInfo.downtime) g_recInfo.downtime = downtimeMs;
         g_recPhysresolveWait = Cfg().phys_resolve_delay; // let physics settle first
         g_recPhysresolve = 1;
-        Log::Debug("[CC-PHYS] physresolve queued: +%d new, %d pending total (ent[0]=%d), firing in %d pulse(s).\n",
+        Log::Debug("[CC-PHYS] physresolve queued: +%d new, %d pending total (ent[0]=%d), %llums downtime, firing in %d pulse(s).\n",
                     added, g_recInfo.entCount, g_recInfo.entCount > 0 ? g_recInfo.entities[0] : -1,
-                    (int)g_recPhysresolveWait);
+                    (unsigned long long)g_recInfo.downtime, (int)g_recPhysresolveWait);
     }
 
     void Recovery::NoteRecovered(const char* method, uint64_t downtimeMs, const char* stall, const char* reason, const char* report)
@@ -849,6 +850,8 @@ namespace CrashCapture {
         t[n++] = {"phys_recover", CK_BOOL, &c.phys_recover, 0, false};
         t[n++] = {"phys_resolve_delay", CK_INT, &c.phys_resolve_delay, 0, false};
         t[n++] = {"phys_pin", CK_BOOL, &c.phys_pin, 0, false};
+        t[n++] = {"phys_hook", CK_BOOL, &c.phys_hook, 0, true};
+        t[n++] = {"phys_hook_ms", CK_INT, &c.phys_hook_ms, 0, false};
         t[n++] = {"debug", CK_BOOL, &c.debug, 0, false};
         t[n++] = {"engine_error", CK_BOOL, &c.engine_error, 0, false};
         t[n++] = {"frame_profile", CK_BOOL, &c.frame_profile, 0, false};
@@ -899,7 +902,7 @@ namespace CrashCapture {
             return 0;
         }
 
-        CfgEntry buf[24];
+        CfgEntry buf[32];
         const CfgEntry* e = FindCfg(key, buf);
         if (!e) return 0;
         if (e->envOnly) {
@@ -921,6 +924,14 @@ namespace CrashCapture {
             if (Cfg().timeout_sec > 0) Watchdog::Start(false);
         } else if (strcmp(key, "lua_heartbeat") == 0) {
             if (Cfg().lua_heartbeat) Lua::InstallHeartbeatAll();
+        } else if (strcmp(key, "debug") == 0) {
+            Log::SetDebug(Cfg().debug);
+        } else if (strcmp(key, "phys_hook_ms") == 0) {
+            if (Cfg().phys_hook_ms < 20) Cfg().phys_hook_ms = 20;
+        } else if (strcmp(key, "report_debounce") == 0) {
+            if (Cfg().report_debounce_sec < 0) Cfg().report_debounce_sec = 0;
+        } else if (strcmp(key, "phys_resolve_delay") == 0) {
+            if (Cfg().phys_resolve_delay < 0) Cfg().phys_resolve_delay = 0;
         }
 
         return 0;
@@ -945,7 +956,7 @@ namespace CrashCapture {
             return 1;
         }
 
-        CfgEntry buf[24];
+        CfgEntry buf[32];
         const CfgEntry* e = FindCfg(key, buf);
         if (!e) { g_api.pushnil(L); return 1; }
 

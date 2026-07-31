@@ -155,6 +155,7 @@ namespace CrashCapture {
                 if (s->st_size && rva < s->st_value + s->st_size) { best = s; break; } // exact
                 if (!best || s->st_value > best->st_value) best = s;
             }
+            if (best && best->st_size && rva >= best->st_value + best->st_size) best = NULL;
             if (best && best->st_name < m->strsz) {
                 mangled = m->strs + best->st_name;
                 off = (unsigned long)(rva - best->st_value);
