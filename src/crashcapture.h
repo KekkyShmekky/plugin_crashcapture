@@ -35,7 +35,7 @@
     #define CC_SIDE "client"
 #endif
 
-#define CC_VERSION "1.2.1"
+#define CC_VERSION "1.2.2"
 #define CC_BUILD __DATE__ " " __TIME__
 
 namespace CrashCapture {
