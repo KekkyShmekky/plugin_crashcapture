@@ -58,6 +58,7 @@ namespace CrashCapture {
     static Fn_stev o_stev = 0;
 
     static bool g_installed = false;
+    static void* g_targets[4] = { 0, 0, 0, 0 };
 
     static thread_local uint64_t g_tickStartNs = 0;
     static thread_local bool g_latched = false;
@@ -150,11 +151,15 @@ namespace CrashCapture {
         if (!okSte || !okUe) {
             Log::F("[Crash Capture] phys hook: FAILED to install core hooks (ste=%d ue=%d) -- "
                    "removing any partial hooks.\n", (int)okSte, (int)okUe);
-            Hook::RemoveAll();
+            if (okSte) Hook::Uninstall((void*)a_ste);
+            if (okUe) Hook::Uninstall((void*)a_ue);
+            o_ste = 0; o_ue = 0;
             return false;
         }
-        if (a_di) Hook::Install((void*)a_di, (void*)h_di, (void**)&o_di);
-        if (a_stev) Hook::Install((void*)a_stev, (void*)h_stev, (void**)&o_stev);
+        g_targets[0] = (void*)a_ste;
+        g_targets[1] = (void*)a_ue;
+        if (a_di && Hook::Install((void*)a_di, (void*)h_di, (void**)&o_di)) g_targets[2] = (void*)a_di;
+        if (a_stev && Hook::Install((void*)a_stev, (void*)h_stev, (void**)&o_stev)) g_targets[3] = (void*)a_stev;
 
         g_installed = true;
         return true;
@@ -163,7 +168,10 @@ namespace CrashCapture {
     void Phys::Bind::Uninstall()
     {
         if (!g_installed) return;
-        Hook::RemoveAll();
+        for (int i = 0; i < 4; ++i) {
+            if (g_targets[i]) Hook::Uninstall(g_targets[i]);
+            g_targets[i] = 0;
+        }
         o_ste = 0; o_ue = 0; o_di = 0; o_stev = 0;
         g_installed = false;
         Log::Debug("[CC-HOOK] removed all IVP detours (%llu lag episode(s) this run).\n",

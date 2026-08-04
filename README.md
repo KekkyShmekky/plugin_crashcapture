@@ -35,6 +35,9 @@ Either way, you get a report file describing the failure.
 Reports are saved as Markdown files in a `crashes/` folder at your GMod root (next to the game's own crash dumps).\
 Each one is named for what happened and when, so they're easy to find and read.
 
+There is also included a `session.txt`, which is a running log of what the plugin itself did.\
+This gets wiped on every boot, you can use this to debug what went wrong with crash capture itself or for more information, this pairs with `CRASHCAPTURE_DEBUG`.
+
 ## How to use it
 
 The easiest and recommended way is to load it as a binary module:
@@ -67,6 +70,8 @@ The defaults are sensible, so you only need these if you want to change somethin
 | `CRASHCAPTURE_REPORT_DEBOUNCE` | `15` | Minimum seconds between repeat reports for the same recurring condition. `0` disables the debounce. |
 | `CRASHCAPTURE_ENGINE_ERROR` | `1` | Capture engine-side fatal errors (`Sys_Error` and friends) instead of letting them exit silently. |
 | `CRASHCAPTURE_FRAME_PROFILE` | `1` | Collect per-frame timing metrics (what `crashcapture.frametime()` returns). |
+| `CRASHCAPTURE_PROFILE` | `0` | Arm the Lua call profiler. |
+| `CRASHCAPTURE_PROFILE_WINDOW` | `300` | Seconds before the profiler retires the current window and starts a fresh one, so it can be left armed indefinitely, `0` never rotates. |
 | `CRASHCAPTURE_DEBUG` | `0` | Verbose internal tracing. Noisy, for troubleshooting the plugin itself. |
 | `CRASHCAPTURE_MEMAPI` | `0` | Expose the `mem.*` API to Lua. Unsafe, see the warning below. |
 | `CRASHCAPTURE_WINDOW_WATCHDOG` | `1` | On Windows clients with no other heartbeat, detect a frozen game by watching its window. |
@@ -97,6 +102,9 @@ crashcapture.set("loopbreak", false)
 print(crashcapture.get("timeout")) -- 30
 crashcapture.pulse() -- manual heartbeat
 crashcapture.frametime() -- returns a table of timing metrics
+crashcapture.set("profile", true) -- start the Lua call profiler
+crashcapture.profile(10) -- top 10 hooks/timers by self time
+crashcapture.profile_reset() -- zero the counters, start a fresh window
 ```
 
 > In plugin mode the Lua table appears a little after the realm comes up (it's
@@ -105,7 +113,7 @@ crashcapture.frametime() -- returns a table of timing metrics
 > `crashcapture.get("ready")` (see [Knowing when it's ready](#knowing-when-its-ready)).
 
 Keys mirror the settings above, lower-cased and without the `CRASHCAPTURE_`
-prefix: `timeout`, `hang_kill`, `max_age_days`, `loopbreak`, `phys_resume`, `phys_recover`, `phys_pin`, `phys_hook_ms`, `phys_resolve_delay`, `debug`, `engine_error`, `frame_profile`, `report_debounce`, `firstchance`, `window_watchdog`, `lua_heartbeat`, `manual_dump`, `symbols`, and `disable`.
+prefix: `timeout`, `hang_kill`, `max_age_days`, `loopbreak`, `phys_resume`, `phys_recover`, `phys_pin`, `phys_hook_ms`, `phys_resolve_delay`, `debug`, `engine_error`, `frame_profile`, `profile`, `profile_window`, `report_debounce`, `firstchance`, `window_watchdog`, `lua_heartbeat`, `manual_dump`, `symbols`, and `disable`.
 
 `dir`, `script`, `memapi` and `phys_hook` are launch-config only: `get` reads them, `set` is refused (they're decided before Lua exists, and `memapi` would be a way to grant itself the unsafe `mem.*` API).\
 `console` is not exposed to Lua at all.
@@ -124,6 +132,51 @@ crashcapture.phys_pause(false) -- resume
   `false` re-arms it.
 - `max_age_days` is only read at startup, so setting it from Lua only affects the next run, `dir` and `script` are launch-config only for the same reason.
 - `phys_hook_ms` applies to the next physics tick and is clamped to `20` minimum, the same as the environment variable.
+
+## Lua call profiler
+
+GMod's own `vprof` can tell you that gamemode hooks cost 8 ms, but not *which* hook, and profiling from Lua with `debug.sethook` breaks Starfall while detouring `hook.Call` costs more than it measures.\
+This does it from C++, above LuaJIT, so an armed profiler costs a couple of nanoseconds per call.
+
+It is off by default.\
+Arm it with `CRASHCAPTURE_PROFILE=1` at launch, or from Lua
+at any time:
+
+```lua
+crashcapture.set("profile", true)
+
+timer.Simple(30, function()
+    for _, e in ipairs(crashcapture.profile(10)) do
+        print(("%-40s %8.2f ms self  %6d calls"):format(e.name, e.self_ms, e.calls))
+    end
+    crashcapture.set("profile", false)
+end)
+```
+
+`crashcapture.profile([limit])` returns a table sorted by self time, highest first, capped at `limit` entries (default 20, max 64):
+
+| field | meaning |
+| --- | --- |
+| `name` | `hook:Think`, `timer:MyAddon_Tick`, `timer.simple:x.lua:42`, `lua:sh_thing.lua:120`, `net:my_message`, or `<unattributed>` |
+| `kind` | `hook`, `timer`, `lua`, `net` or `other` |
+| `source` | full path: timer creation site, or the Lua file for `lua` entries |
+| `calls` | times entered during the window |
+| `self_ms` | time in this entry, excluding nested Lua calls it made |
+| `total_ms` | time including everything it called |
+| `p50_ms` | median call |
+| `p99_ms` | 99th percentile call |
+| `max_ms` | the single worst call |
+
+The table itself also carries `enabled`, `window_ms`, `completed`, `depth` (Lua
+calls in flight right now), `buckets` / `bucket_max`, and `dropped`.
+
+### What it can and cannot see
+
+- Attribution is **per hook name, not per addon**.
+  - `hook:Think` still aggregates every `hook.Add("Think", ...)` on the server.
+  - It tells you which hook is expensive, not whose code.
+- `timer.Simple` callbacks on Windows are named by the closure (`lua:...`) rather than as `timer.simple:...`
+  - Because MSVC inlines the callback runner into the simple-timer drain and removes the hook point that supplies the timer's creation site.
 
 ## Knowing when it's ready
 

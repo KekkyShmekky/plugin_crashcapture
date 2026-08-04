@@ -21,6 +21,12 @@ namespace CrashCapture {
         static const int kJmpLen = 5; // E9 rel32
     #endif
 
+    #if defined(CC_LINUX) && defined(CC_X86)
+        static const bool kPcThunkRisk = true;
+    #else
+        static const bool kPcThunkRisk = false;
+    #endif
+
     struct HookRec {
         unsigned char* target;
         unsigned char orig[32];
@@ -32,9 +38,10 @@ namespace CrashCapture {
     static int     g_nHooks = 0;
 
     // decode one instruction at p, returns its length, or 0 if we can't safely relocate it
-    static int DecodeInsn(const unsigned char* p, int* ripDisp)
+    static int DecodeInsn(const unsigned char* p, int* ripDisp, int* relDisp)
     { // this is unironically, painful, as hell.
         if (ripDisp) *ripDisp = -1;
+        if (relDisp) *relDisp = -1;
         int i = 0;
         bool opsize = false;
         for (;;) { // yes I know this looks cursed.
@@ -53,6 +60,10 @@ namespace CrashCapture {
         if (op == 0x90 || op == 0xC9 || op == 0xC3) return i; // nop / leave / ret
         if (op == 0x68) return i + (opsize ? 2 : 4); // push imm
         if (op == 0x6A) return i + 1; // push imm8
+        if (op == 0xE9 || (op == 0xE8 && !kPcThunkRisk)) { // __x86.get_pc_thunk.bx
+            if (relDisp) *relDisp = i;
+            return i + 4;
+        }
 
         bool hasModRM = false;
         int  imm = 0;
@@ -178,11 +189,13 @@ namespace CrashCapture {
         // measure whole instructions until we cover the patch jump.
         int total = 0;
         int ripOff[8]; int nRip = 0;
+        int relOff[8]; int nRel = 0;
         while (total < kJmpLen) {
-            int rd = -1;
-            int l = DecodeInsn(t + total, &rd);
+            int rd = -1, bd = -1;
+            int l = DecodeInsn(t + total, &rd, &bd);
             if (l <= 0) return false; // un-relocatable prologue -> refuse
             if (rd >= 0 && nRip < 8) ripOff[nRip++] = total + rd;
+            if (bd >= 0 && nRel < 8) relOff[nRel++] = total + bd;
             total += l;
         }
         if (total > (int)sizeof(g_hooks[0].orig)) return false;
@@ -200,8 +213,20 @@ namespace CrashCapture {
                 if (nd < INT32_MIN || nd > INT32_MAX) return false; // trampoline too far -> bail
                 *(int32_t*)(tramp + off) = (int32_t)nd;
             }
+            for (int i = 0; i < nRel; ++i) {
+                int off = relOff[i];
+                int64_t delta = (int64_t)((uintptr_t)t - (uintptr_t)tramp);
+                int64_t nd = (int64_t)(*(int32_t*)(tramp + off)) + delta;
+                if (nd < INT32_MIN || nd > INT32_MAX) return false;
+                *(int32_t*)(tramp + off) = (int32_t)nd;
+            }
         #else
-            (void)ripOff; (void)nRip;
+            (void)ripOff; (void)nRip; // mod=00 rm=101 is absolute on x86, nothing to fix rel32 wraps mod 2^32
+            for (int i = 0; i < nRel; ++i) {
+                int off = relOff[i];
+                int32_t delta = (int32_t)((uintptr_t)t - (uintptr_t)tramp);
+                *(int32_t*)(tramp + off) += delta;
+            }
         #endif
         WriteJmp(tramp + total, t + total); // jump back to target+total
 

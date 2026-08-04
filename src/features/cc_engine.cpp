@@ -2,6 +2,7 @@
 
 #include "crashcapture.h"
 #include "features/cc_engine.h"
+#include "features/cc_profile.h"
 #include "tools/cc_hooking.h"
 #include "tools/cc_signature.h"
 #include <stdarg.h>
@@ -125,6 +126,7 @@ namespace CrashCapture {
 
     static void h_hostframe(float time)
     {
+        Profile::FrameBoundary();
         uint64_t entry = NowNs();
         double sleep = g_lastExitNs ? (double)(entry - g_lastExitNs) / 1e6 : 0.0; // idle before this frame
 

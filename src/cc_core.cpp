@@ -2,6 +2,7 @@
 
 #include "crashcapture.h"
 #include "features/cc_physrecover.h"
+#include "features/cc_profile.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -169,6 +170,9 @@ namespace CrashCapture {
         c.symbols = EnvInt("CRASHCAPTURE_SYMBOLS", 1) != 0;
         c.engine_error = EnvInt("CRASHCAPTURE_ENGINE_ERROR", 1) != 0;
         c.frame_profile = EnvInt("CRASHCAPTURE_FRAME_PROFILE", 1) != 0;
+        c.profile = EnvInt("CRASHCAPTURE_PROFILE", 0) != 0;
+        c.profile_window = EnvInt("CRASHCAPTURE_PROFILE_WINDOW", 300);
+        if (c.profile_window < 0) c.profile_window = 0;
         c.memapi = EnvInt("CRASHCAPTURE_MEMAPI", 0) != 0;
 
         // store crashes in <gmod-root>/crashes
@@ -260,6 +264,8 @@ namespace CrashCapture {
         g_startMs = MonotonicMs();
 
         LoadConfig();
+        Log::OpenSession();
+        Log::Debug("Crash Capture - v" CC_VERSION " " CC_OS "/" CC_ARCH "/" CC_SIDE " (" CC_BUILD ")\n");
         PruneOldReports();
 
         // client preloading can cause issues of loading into telemetry, this fixes that.
@@ -282,6 +288,7 @@ namespace CrashCapture {
     // Resolve modules + Lua, install handlers, print the armed banner.
     void InstallHandlers()
     {
+        Log::Debug("[Crash Capture] Installing Handlers\n");
         Modules::Refresh();
         Lua::RefreshStates();
         Platform::Install();
@@ -316,15 +323,19 @@ namespace CrashCapture {
         Platform::Uninstall();
         g_initialized = false;
         Log::Str("[Crash Capture] disarmed.\n");
+        Log::CloseSession();
     }
 
     void Pulse()
     {
+        static bool first = true;
+        if (first) { first = false; Log::Debug("[Crash Capture] first pulse\n"); }
         Watchdog::Pulse();
         Log::PumpConsole();
         #if defined(CC_LINUX) // TODO: windows at some point.
             Phys::Recover::PollGameThread();
         #endif
+        Profile::Poll();
         Lua::PollRecovery();
         Lua::PollReady();
     }
@@ -464,6 +475,17 @@ namespace CrashCapture {
         }
     }
 
+    static void AppendInFlight(char* out, size_t outsz)
+    {
+        int d = Profile::Depth();
+        if (d <= 0) return;
+        const char* nm = Profile::NameAt(d - 1);
+        if (!nm || !*nm) return;
+        size_t len = strlen(out);
+        if (len + 8 >= outsz) return;
+        snprintf(out + len, outsz - len, " in %s", nm);
+    }
+
     int Report::ClassifyStall(void* ctx, char* out, size_t outsz)
     {
         uintptr_t pc = Platform::ContextPC(ctx);
@@ -472,10 +494,12 @@ namespace CrashCapture {
         const CCModule* m = Modules::Find(pc);
         if (m && strstr(m->name, "lua_shared")) {
             snprintf(out, outsz, "lua (interpreter)");
+            AppendInFlight(out, outsz);
             return STALL_LUA_INTERP;
         }
         if ((!m || strcmp(m->name, "[anon-exec]") == 0) && Mem::IsExecutable(pc)) {
             snprintf(out, outsz, "lua (JIT trace / mcode)");
+            AppendInFlight(out, outsz);
             return STALL_LUA_JIT;
         }
         if (m) {

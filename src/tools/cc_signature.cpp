@@ -3,6 +3,11 @@
 #include "tools/cc_signature.h"
 #include <string.h>
 
+#if defined(CC_WINDOWS)
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+#endif
+
 namespace CrashCapture {
     static const uintptr_t kPageMask = 0xFFF; // 4 KiB pages on all targets
 
@@ -58,17 +63,15 @@ namespace CrashCapture {
             if (p->mask[i]) skip[p->bytes[i]] = len - 1 - i;
     }
 
-    static int ScanCore(const CCModule* m, const CCPattern* p, uintptr_t* out, int max)
+    static int ScanRange(uintptr_t base, uintptr_t end, const CCPattern* p, uintptr_t* out, int max)
     {
-        if (!m || !p || p->len <= 0 || max <= 0) return 0;
+        if (!p || p->len <= 0 || max <= 0 || end <= base) return 0;
         const int len = p->len;
-        if (m->size < (size_t)len) return 0;
+        if (end - base < (uintptr_t)len) return 0;
 
         int skip[256];
         BuildSkip(p, skip);
 
-        const uintptr_t base = m->base;
-        const uintptr_t end  = m->base + m->size;
         uintptr_t readableEnd = base; // exclusive: bytes < this are confirmed mapped
         uintptr_t pos = base;
         int count = 0;
@@ -103,6 +106,12 @@ namespace CrashCapture {
             pos += (uintptr_t)skip[*(const unsigned char*)(pos + len - 1)];
         }
         return count;
+    }
+
+    static int ScanCore(const CCModule* m, const CCPattern* p, uintptr_t* out, int max)
+    {
+        if (!m) return 0;
+        return ScanRange(m->base, m->base + m->size, p, out, max);
     }
 
     uintptr_t Sig::Find(const CCModule* m, const CCPattern* p)
@@ -150,6 +159,146 @@ namespace CrashCapture {
         void* p;
         memcpy(&p, (void*)at, sizeof(void*));
         return (uintptr_t)p;
+    }
+
+    // --------- cc-sig-anchor ---
+
+    uintptr_t Sig::FindLiteral(const CCModule* m, const char* text)
+    {
+        if (!m || !text || !*text) return 0;
+        size_t n = strlen(text);
+        if (n + 1 > (size_t)kSigMaxLen) return 0;
+
+        CCPattern pat;
+        for (size_t i = 0; i <= n; ++i) {
+            pat.bytes[i] = (unsigned char)text[i];
+            pat.mask[i] = 1;
+        }
+        pat.len = (int)n + 1;
+
+        size_t span = 0;
+        uintptr_t lb = Modules::FileExtent(m, &span);
+        uintptr_t hit = 0;
+        return ScanRange(lb, lb + span, &pat, &hit, 1) ? hit : 0;
+    }
+
+    int Sig::FindRefs(const CCModule* m, uintptr_t target, uintptr_t* out, int max)
+    {
+        if (!m || !target || !out || max <= 0) return 0;
+
+        const uintptr_t base = m->base + 1; // x64 peeks at the modrm byte behind the operand
+        const uintptr_t end = m->base + m->size;
+        int count = 0;
+        bool pageOk = false;
+
+        for (uintptr_t a = base; a + 4 <= end; ++a) {
+            if (!pageOk || (a & kPageMask) == 0) {
+                if (!Mem::IsReadable((void*)(a & ~kPageMask), 1)) { a = (a | kPageMask); pageOk = false; continue; }
+                pageOk = true;
+            }
+
+            #if defined(CC_X64)
+                // rip-relative: the disp32 always ends its instruction, and the modrm byte
+                // right before it is mod=00 rm=101.
+                if ((*(const unsigned char*)(a - 1) & 0xC7) != 0x05) continue;
+            #endif
+
+            uint32_t raw;
+            memcpy(&raw, (const void*)a, 4);
+
+            #if defined(CC_X64)
+                if (a + 4 + (uintptr_t)(intptr_t)(int32_t)raw != target) continue;
+            #else
+                if ((uintptr_t)raw != target) continue;
+            #endif
+
+            out[count++] = a;
+            if (count >= max) break;
+        }
+        return count;
+    }
+
+    uintptr_t Sig::FuncStart(const CCModule* m, uintptr_t inside)
+    {
+        if (!m || !inside) return 0;
+
+        #if defined(CC_WINDOWS) && defined(CC_X64)
+            {
+                uintptr_t imageBase = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry((DWORD64)inside, (PDWORD64)&imageBase, NULL);
+                for (int hop = 0; rf && imageBase && hop < 8; ++hop) {
+                    const unsigned char* ui = (const unsigned char*)(imageBase + ((const uint32_t*)rf)[2]);
+                    if (!Mem::IsReadable(ui, 4) || (ui[0] & 0x20) == 0) break;
+                    const uint32_t* parent = (const uint32_t*)(ui + 4 + 2 * ((ui[2] + 1) & ~1));
+                    if (!Mem::IsReadable(parent, 12)) break;
+                    rf = (PRUNTIME_FUNCTION)parent;
+                }
+                if (rf && imageBase) return imageBase + rf->BeginAddress;
+            }
+        #endif
+
+        const uintptr_t kMaxBack = 0x600;
+        uintptr_t low = m->base + 2;
+        if (inside > kMaxBack && inside - kMaxBack > low) low = inside - kMaxBack;
+
+        for (uintptr_t c = inside & ~(uintptr_t)0xF; c >= low; c -= 16) {
+            if (!Mem::IsReadable((void*)(c - 2), 3)) break;
+            unsigned char prev = *(const unsigned char*)(c - 1);
+            #if defined(CC_WINDOWS)
+                if (prev == 0xCC && *(const unsigned char*)(c - 2) == 0xCC) return c;
+            #else
+                if (*(const unsigned char*)c == 0x55 &&
+                    (prev == 0x90 || prev == 0x00 || prev == 0xCC || prev == 0xC3)) return c;
+            #endif
+        }
+        return 0;
+    }
+
+    int Sig::AnchorAll(const char* module, const char* literal, uintptr_t* out, int max)
+    {
+        if (!out || max <= 0) return 0;
+        const CCModule* m = module ? Modules::FindByName(module) : NULL;
+        if (!m) return 0;
+
+        uintptr_t lit = Sig::FindLiteral(m, literal);
+        if (!lit) return 0;
+
+        uintptr_t refs[8];
+        int nrefs = Sig::FindRefs(m, lit, refs, 8);
+
+        int count = 0;
+        for (int i = 0; i < nrefs; ++i) {
+            uintptr_t fn = Sig::FuncStart(m, refs[i]);
+            if (!fn) continue;
+            bool dup = false;
+            for (int j = 0; j < count; ++j) if (out[j] == fn) { dup = true; break; }
+            if (dup) continue;
+            out[count++] = fn;
+            if (count >= max) break;
+        }
+        return count;
+    }
+
+    uintptr_t Sig::Anchor(const char* module, const char* literal)
+    {
+        const CCModule* m = module ? Modules::FindByName(module) : NULL;
+        if (!m) return 0;
+
+        uintptr_t lit = Sig::FindLiteral(m, literal);
+        if (!lit) return 0;
+
+        uintptr_t refs[8];
+        int nrefs = Sig::FindRefs(m, lit, refs, 8);
+
+        uintptr_t best = 0;
+        uintptr_t bestDelta = (uintptr_t)-1;
+        for (int i = 0; i < nrefs; ++i) {
+            uintptr_t fn = Sig::FuncStart(m, refs[i]);
+            if (!fn || fn > refs[i]) continue;
+            uintptr_t d = refs[i] - fn;
+            if (d < bestDelta) { bestDelta = d; best = fn; }
+        }
+        return best;
     }
 
     // --------- cc-sig-registry ---

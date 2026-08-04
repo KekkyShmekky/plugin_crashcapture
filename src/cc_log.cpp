@@ -27,6 +27,59 @@ namespace CrashCapture::Log {
     #endif
     static char g_path[768];
 
+    // --------- cc-log-session ---
+    
+    #if defined(CC_WINDOWS)
+        static HANDLE g_session = INVALID_HANDLE_VALUE;
+    #else
+        static int g_session = -1;
+    #endif
+    static uint64_t g_sessionStartMs = 0;
+    static bool g_sessionBol = true;
+
+    static void SessionRaw(const char* s, size_t len)
+    {
+        #if defined(CC_WINDOWS)
+            if (g_session == INVALID_HANDLE_VALUE) return;
+            DWORD w = 0;
+            WriteFile(g_session, s, (DWORD)len, &w, NULL);
+        #else
+            if (g_session < 0) return;
+            ssize_t r = write(g_session, s, len);
+            (void)r;
+        #endif
+    }
+
+    static bool SessionOpen()
+    {
+        #if defined(CC_WINDOWS)
+            return g_session != INVALID_HANDLE_VALUE;
+        #else
+            return g_session >= 0;
+        #endif
+    }
+
+    static void SessionWrite(const char* s, size_t len)
+    {
+        if (!SessionOpen() || !s || !len) return;
+        size_t start = 0;
+        for (size_t i = 0; i < len; ++i) {
+            if (g_sessionBol) {
+                char stamp[24];
+                int n = snprintf(stamp, sizeof(stamp), "[%8llu] ",
+                                 (unsigned long long)(MonotonicMs() - g_sessionStartMs));
+                if (n > 0) SessionRaw(stamp, (size_t)n);
+                g_sessionBol = false;
+            }
+            if (s[i] == '\n') {
+                SessionRaw(s + start, i - start + 1);
+                start = i + 1;
+                g_sessionBol = true;
+            }
+        }
+        if (start < len) SessionRaw(s + start, len - start);
+    }
+
     bool IsOpen()
     {
         #if defined(CC_WINDOWS)
@@ -226,6 +279,7 @@ namespace CrashCapture::Log {
                 (void)r;
             }
         #endif
+        if (!IsOpen()) SessionWrite(s, len);
         if (!IsOpen() || Cfg().console)
             ConsoleOut(s, len, !IsOpen());
     }
@@ -243,6 +297,7 @@ namespace CrashCapture::Log {
         #if defined(CC_WINDOWS)
             OutputDebugStringA(buf);
         #endif
+        SessionWrite(buf, (size_t)len);
         ConsoleOut(buf, (size_t)len, true);
     }
 
@@ -262,6 +317,7 @@ namespace CrashCapture::Log {
         #if defined(CC_WINDOWS)
             OutputDebugStringA(buf);
         #endif
+        SessionWrite(buf, (size_t)len);
         ConsoleOut(buf, (size_t)len, false);
     }
 
@@ -348,6 +404,37 @@ namespace CrashCapture::Log {
             ssize_t r = write(fd, text, strlen(text));
             (void)r;
             close(fd);
+        #endif
+    }
+
+    bool OpenSession()
+    {
+        if (SessionOpen()) return true;
+        g_sessionStartMs = MonotonicMs();
+        g_sessionBol = true;
+
+        char path[768];
+        snprintf(path, sizeof(path), "%s/session.txt", Cfg().dir);
+        #if defined(CC_WINDOWS)
+            g_session = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (g_session == INVALID_HANDLE_VALUE) return false;
+        #else
+            g_session = open(path, O_TRUNC | O_WRONLY | O_CREAT, 0666);
+            if (g_session < 0) return false;
+        #endif
+        return true;
+    }
+
+    void CloseSession()
+    {
+        if (!SessionOpen()) return;
+        #if defined(CC_WINDOWS)
+            CloseHandle(g_session);
+            g_session = INVALID_HANDLE_VALUE;
+        #else
+            close(g_session);
+            g_session = -1;
         #endif
     }
 

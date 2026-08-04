@@ -76,6 +76,7 @@ namespace CrashCapture {
                 m.base = (uintptr_t)e->DllBase;
                 m.loadbase = m.base;
                 m.size = (size_t)e->SizeOfImage;
+                m.fileend = m.base + m.size;
                 WideToUtf8(e->BaseDllName.Buffer,
                         e->BaseDllName.Length / (int)sizeof(wchar_t),
                         m.name, sizeof(m.name));
@@ -202,6 +203,7 @@ namespace CrashCapture {
                         m.base = (uintptr_t)start;
                         m.loadbase = curLoad ? curLoad : m.base;
                         m.size = (size_t)(end - start);
+                        m.fileend = (uintptr_t)end;
                         snprintf(m.name, sizeof(m.name), "%s", base);
                     }
                 } else if (exec && g_moduleCount < kMaxModules) {
@@ -210,7 +212,18 @@ namespace CrashCapture {
                     m.base = (uintptr_t)start;
                     m.loadbase = m.base;
                     m.size = (size_t)(end - start);
+                    m.fileend = (uintptr_t)end;
                     snprintf(m.name, sizeof(m.name), "[anon-exec]");
+                }
+
+                if (filebacked) {
+                    char base[96];
+                    BaseName(path, base, sizeof(base));
+                    for (int i = 0; i < g_moduleCount; ++i)
+                        if (strcmp(g_modules[i].name, base) == 0) {
+                            if ((uintptr_t)end > g_modules[i].fileend) g_modules[i].fileend = (uintptr_t)end;
+                            break;
+                        }
                 }
 
                 line = nl ? nl + 1 : NULL;
@@ -262,6 +275,14 @@ namespace CrashCapture {
         return m->loadbase;
     }
 
+    uintptr_t Modules::FileExtent(const CCModule* m, size_t* sizeOut)
+    {
+        if (!m) { if (sizeOut) *sizeOut = 0; return 0; }
+        uintptr_t end = m->fileend > m->base + m->size ? m->fileend : m->base + m->size;
+        if (sizeOut) *sizeOut = (size_t)(end - m->loadbase);
+        return m->loadbase;
+    }
+
     const CCModule* Modules::Find(uintptr_t addr)
     {
         for (int i = 0; i < g_moduleCount; ++i) {
@@ -271,25 +292,50 @@ namespace CrashCapture {
         return NULL;
     }
 
+    static int NameScore(const char* hay, const char* needle)
+    {
+        const char* a = hay; const char* b = needle;
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca += 32;
+            if (cb >= 'A' && cb <= 'Z') cb += 32;
+            if (ca != cb) break;
+            ++a; ++b;
+        }
+        if (!*b) {
+            if (!*a || *a == '.') return 3;
+            if (*a == '_') return 2;
+        }
+        for (const char* h = hay; *h; ++h) {
+            const char* x = h; const char* y = needle;
+            while (*x && *y) {
+                char cx = *x, cy = *y;
+                if (cx >= 'A' && cx <= 'Z') cx += 32;
+                if (cy >= 'A' && cy <= 'Z') cy += 32;
+                if (cx != cy) break;
+                ++x; ++y;
+            }
+            if (!*y) return 1;
+        }
+        return 0;
+    }
+
     const CCModule* Modules::FindByName(const char* needle)
     {
         if (!needle || !*needle) return NULL;
+        const CCModule* best = NULL;
+        int bestScore = 0;
         for (int i = 0; i < g_moduleCount; ++i) {
-            const char* hay = g_modules[i].name;
-            // case-insensitive substring match
-            for (const char* h = hay; *h; ++h) {
-                const char* a = h; const char* b = needle;
-                while (*a && *b) {
-                    char ca = *a, cb = *b;
-                    if (ca >= 'A' && ca <= 'Z') ca += 32;
-                    if (cb >= 'A' && cb <= 'Z') cb += 32;
-                    if (ca != cb) break;
-                    ++a; ++b;
-                }
-                if (!*b) return &g_modules[i];
-            }
+            int s = NameScore(g_modules[i].name, needle);
+            if (s > bestScore) { bestScore = s; best = &g_modules[i]; }
+            if (bestScore == 3) break;
         }
-        return NULL;
+        return best;
+    }
+
+    bool Modules::IsExactName(const CCModule* m, const char* needle)
+    {
+        return m && needle && NameScore(m->name, needle) >= 2;
     }
 
     int Modules::Snapshot(const CCModule** out)
