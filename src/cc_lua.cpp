@@ -4,6 +4,7 @@
 #include "crashcapture.h"
 
 #include "features/cc_engine.h"
+#include "features/cc_profile.h"
 #include "tools/cc_hooking.h"
 #include "tools/cc_signature.h"
 
@@ -42,7 +43,8 @@ namespace CrashCapture {
 
     // lua_Debug must match LuaJIT's layout byte-for-byte
     // this better not change... ever...
-    #define CC_LUA_IDSIZE 60
+    // reality check: it does, IDSIZE -> 128, not 60...
+    #define CC_LUA_IDSIZE 128
     struct cc_lua_Debug {
         int         event;
         const char* name;
@@ -55,6 +57,8 @@ namespace CrashCapture {
         int         lastlinedefined;
         char        short_src[CC_LUA_IDSIZE];
         int         i_ci;
+        int         nparams;
+        int         isvararg;
     };
 
     typedef void (*cc_lua_Hook)(lua_State*, cc_lua_Debug*);
@@ -131,6 +135,14 @@ namespace CrashCapture {
             return false;
         }
     #endif
+
+    void* Lua::Iface(int realm)
+    {
+        if (realm < 0 || realm > 2) return NULL;
+        if (g_shared) return (void*)g_shared->GetLuaInterface((unsigned char)realm);
+        ILuaInterface* l = g_realm[realm];
+        return (l && Mem::IsReadable(l, 2 * sizeof(void*))) ? (void*)l : NULL;
+    }
 
     // Handle to the loaded lua_shared for symbol lookup. Resolved at arm time.
     void* Lua::SharedHandle()
@@ -788,11 +800,8 @@ namespace CrashCapture {
 
     static int cc_lua_pulse(lua_State*)
     {
-        Watchdog::Pulse();
-        Log::PumpConsole();
+        CrashCapture::Pulse();
         if (!g_moduleLoad) Lua::EnsureApi();
-        Lua::PollRecovery();
-        Lua::PollReady();
         return 0;
     }
 
@@ -855,6 +864,8 @@ namespace CrashCapture {
         t[n++] = {"debug", CK_BOOL, &c.debug, 0, false};
         t[n++] = {"engine_error", CK_BOOL, &c.engine_error, 0, false};
         t[n++] = {"frame_profile", CK_BOOL, &c.frame_profile, 0, false};
+        t[n++] = {"profile", CK_BOOL, &c.profile, 0, false};
+        t[n++] = {"profile_window", CK_INT, &c.profile_window, 0, false};
         t[n++] = {"report_debounce", CK_INT, &c.report_debounce_sec, 0, false};
         t[n++] = {"firstchance", CK_BOOL, &c.firstchance, 0, false};
         t[n++] = {"window_watchdog", CK_BOOL, &c.window_watchdog, 0, false};
@@ -926,6 +937,10 @@ namespace CrashCapture {
             if (Cfg().lua_heartbeat) Lua::InstallHeartbeatAll();
         } else if (strcmp(key, "debug") == 0) {
             Log::SetDebug(Cfg().debug);
+        } else if (strcmp(key, "profile") == 0) {
+            Profile::SetEnabled(Cfg().profile);
+        } else if (strcmp(key, "profile_window") == 0) {
+            if (Cfg().profile_window < 0) Cfg().profile_window = 0;
         } else if (strcmp(key, "phys_hook_ms") == 0) {
             if (Cfg().phys_hook_ms < 20) Cfg().phys_hook_ms = 20;
         } else if (strcmp(key, "report_debounce") == 0) {
@@ -1395,6 +1410,52 @@ namespace CrashCapture {
         return 1;
     }
 
+    static int cc_lua_profile(lua_State* L)
+    {
+        ILuaInterface* l = IfaceForState(L);
+        if (!l) { if (g_api.push_ok) { g_api.pushnil(L); return 1; } return 0; }
+
+        int limit = 20;
+        if (g_api.ok && g_api.gettop(L) >= 1 && g_api.type(L, 1) == CC_LT_NUM)
+            limit = (int)g_api.tonumber(L, 1);
+        if (limit <= 0 || limit > 64) limit = 64;
+
+        static ProfileBucket snap[64];
+        ProfileView v = Profile::Snapshot(snap, limit);
+
+        l->CreateTable();
+        l->PushNumber(v.windowMs); l->SetField(-2, "window_ms");
+        l->PushBool(v.previous); l->SetField(-2, "completed");
+        l->PushNumber((double)v.dropped); l->SetField(-2, "dropped");
+        l->PushNumber((double)Profile::Depth()); l->SetField(-2, "depth");
+        l->PushNumber((double)v.buckets); l->SetField(-2, "buckets");
+        l->PushNumber((double)Profile::BucketMax()); l->SetField(-2, "bucket_max");
+
+        for (int i = 0; i < v.count; ++i) {
+            const ProfileBucket& b = snap[i];
+            l->PushNumber((double)(i + 1));
+            l->CreateTable();
+                l->PushString(b.name); l->SetField(-2, "name");
+                l->PushString(Profile::KindName(b.kind)); l->SetField(-2, "kind");
+                if (b.source[0]) { l->PushString(b.source); l->SetField(-2, "source"); }
+                l->PushNumber((double)b.calls); l->SetField(-2, "calls");
+                l->PushNumber(b.selfMs); l->SetField(-2, "self_ms");
+                l->PushNumber(b.totalMs); l->SetField(-2, "total_ms");
+                l->PushNumber(b.p50Ms); l->SetField(-2, "p50_ms");
+                l->PushNumber(b.p99Ms); l->SetField(-2, "p99_ms");
+                l->PushNumber(b.maxMs); l->SetField(-2, "max_ms");
+            l->SetTable(-3);
+        }
+        return 1;
+    }
+
+    static int cc_lua_profile_reset(lua_State* L)
+    {
+        (void)L;
+        Profile::Rotate();
+        return 0;
+    }
+
     // --------- lua-bootstrap (sideload) ---
     typedef int (*Fn_lua_pcall)(lua_State*, int, int, int);
     static Fn_lua_pcall o_lua_pcall = 0;
@@ -1450,6 +1511,8 @@ namespace CrashCapture {
             L->PushCFunction(cc_lua_dump); L->SetField(-2, "dump");
             L->PushCFunction(cc_lua_trace); L->SetField(-2, "trace");
             L->PushCFunction(cc_lua_frametime); L->SetField(-2, "frametime");
+            L->PushCFunction(cc_lua_profile); L->SetField(-2, "profile");
+            L->PushCFunction(cc_lua_profile_reset); L->SetField(-2, "profile_reset");
             L->PushString(CC_VERSION); L->SetField(-2, "version");
             L->PushString(CC_BUILD); L->SetField(-2, "build");
             L->PushString(CC_OS); L->SetField(-2, "os");

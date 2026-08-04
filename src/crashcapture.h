@@ -35,7 +35,7 @@
     #define CC_SIDE "client"
 #endif
 
-#define CC_VERSION "1.2.2"
+#define CC_VERSION "1.3.0"
 #define CC_BUILD __DATE__ " " __TIME__
 
 namespace CrashCapture {
@@ -61,6 +61,8 @@ namespace CrashCapture {
         bool symbols;         // CRASHCAPTURE_SYMBOLS
         bool engine_error;    // CRASHCAPTURE_ENGINE_ERROR
         bool frame_profile;   // CRASHCAPTURE_FRAME_PROFILE
+        bool profile;         // CRASHCAPTURE_PROFILE
+        int profile_window;   // CRASHCAPTURE_PROFILE_WINDOW
         bool memapi;          // CRASHCAPTURE_MEMAPI
         char dir[512];        // CRASHCAPTURE_DIR
         char script[512];     // CRASHCAPTURE_SCRIPT
@@ -87,6 +89,8 @@ namespace CrashCapture {
     namespace Log {
         bool Open(const char* kind);
         void Close();
+        bool OpenSession();
+        void CloseSession();
         bool IsOpen();
         const char* Path();
         void Raw(const char* s, size_t len);
@@ -111,6 +115,7 @@ namespace CrashCapture {
         uintptr_t base;
         uintptr_t loadbase;
         size_t size;
+        uintptr_t fileend;
         char name[96]; // basename only
     };
     struct CCThread {
@@ -125,8 +130,10 @@ namespace CrashCapture {
         int  Refresh();
         bool HasLua();
         uintptr_t Extent(const CCModule* m, size_t* sizeOut);
+        uintptr_t FileExtent(const CCModule* m, size_t* sizeOut);
         const CCModule* Find(uintptr_t addr);
         const CCModule* FindByName(const char* needle);
+        bool IsExactName(const CCModule* m, const char* needle);
         int  Snapshot(const CCModule** out);
         void Dump();
     }
@@ -173,6 +180,7 @@ namespace CrashCapture {
         bool EnsureApi();
         bool InstallSideloadBootstrap();
         void* SharedHandle();
+        void* Iface(int realm);
         void* Sym(void* mod, const char* name);
         void PollRecovery();
         void PollReady();

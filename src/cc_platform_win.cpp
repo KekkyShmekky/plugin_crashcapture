@@ -236,11 +236,11 @@ namespace CrashCapture {
     static void Sec_StackScan(void*)   { Report::StackScan(g_curCtx); }
     static void Sec_Lua(void*)         { Lua::Dump(); }
     static void Sec_Modules(void*)     { Modules::Dump(); }
-    static void Sec_EngineFrame(void*) { Engine::ReportFrameProfile(); }
+    static void Sec_EngineFrame(void*) { Engine::ReportFrameProfile(); Profile::ReportSection(); }
 
     static void EmitSections()
     {
-        { EngineFrameStats efs; if (Engine::FrameStats(&efs)) Report::Section("Profiling", Sec_EngineFrame, NULL, false); }
+        { EngineFrameStats efs; if (Engine::FrameStats(&efs) || Profile::HasSamples()) Report::Section("Profiling", Sec_EngineFrame, NULL, false); }
         Report::Section("Registers",   Sec_Registers, NULL, true);
         Report::Section("Native stack", Sec_Stack,    NULL, true);
         Report::Section("Stack scan (code pointers)", Sec_StackScan, NULL, true);
@@ -420,7 +420,7 @@ namespace CrashCapture {
             }
         }
 
-        { EngineFrameStats efs; if (Engine::FrameStats(&efs)) Report::Section("Profiling", Sec_EngineFrame, NULL, false); }
+        { EngineFrameStats efs; if (Engine::FrameStats(&efs) || Profile::HasSamples()) Report::Section("Profiling", Sec_EngineFrame, NULL, false); }
         Report::Section("Registers", Sec_Registers, NULL, true);
         Report::Section("Native stack", Sec_Stack, NULL, true);
         Report::Section("Stack scan (code pointers)", Sec_StackScan, NULL, true);

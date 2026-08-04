@@ -69,6 +69,13 @@ namespace CrashCapture {
         uintptr_t Abs32(uintptr_t at, int opOff); // x86 abs operand
         uintptr_t Deref(uintptr_t at); // *(void**)at
 
+        // --------- cc-sig-anchor ---
+        uintptr_t FindLiteral(const CCModule* m, const char* text); // NUL-terminated literal in the module's data, 0 if absent
+        int  FindRefs(const CCModule* m, uintptr_t target, uintptr_t* out, int max); // code sites whose operand resolves to `target`
+        uintptr_t FuncStart(const CCModule* m, uintptr_t inside); // walk back to the enclosing function's first byte
+        int  AnchorAll(const char* module, const char* literal, uintptr_t* out, int max); // distinct functions referencing `literal`
+        uintptr_t Anchor(const char* module, const char* literal); // the innermost one (smallest ref-to-start delta)
+
         // --------- cc-sig-registry ---
         uintptr_t Resolve(const CCTarget* t); // resolve one target directly (no cache)
         void Register(const CCTarget* targets, int count); // register a target table (static lifetime), before Init
