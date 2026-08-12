@@ -136,12 +136,77 @@ namespace CrashCapture {
         }
     #endif
 
+    static uintptr_t g_ifaceVtable = 0;
+
+    static bool AddrInModuleImage(uintptr_t a)
+    {
+        const CCModule* mods = NULL;
+        int n = Modules::Snapshot(&mods);
+        for (int i = 0; i < n; ++i) {
+            size_t span = 0;
+            uintptr_t base = Modules::FileExtent(&mods[i], &span);
+            if (span && a >= base && a < base + span) return true;
+        }
+        return false;
+    }
+
+    bool Lua::IfaceLive(void* iface)
+    {
+        ILuaInterface* l = (ILuaInterface*)iface;
+        if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) return false;
+
+        uintptr_t vt = *(const uintptr_t*)l;
+        if (!vt || (vt & (sizeof(void*) - 1))) return false;
+        if (vt == g_ifaceVtable) return true;
+
+        if (!Mem::IsReadable((const void*)vt, sizeof(void*))) return false;
+        if (!AddrInModuleImage(vt)) {
+            if (Modules::FindByName("lua_shared")) return false;
+            Modules::Refresh();
+            if (!AddrInModuleImage(vt)) return false;
+        }
+        if (!Mem::IsExecutable(*(const uintptr_t*)vt)) return false;
+
+        g_ifaceVtable = vt;
+        return true;
+    }
+
+    static void ClearRealm(int r)
+    {
+        g_realm[r] = NULL;
+        g_apiState[r] = NULL;
+        g_apiInstalled[r] = false;
+        g_hbInstalled[r] = false;
+        g_readyPending[r] = false;
+        g_readyFired[r] = false;
+    }
+
+    static ILuaInterface* LiveRealm(int r)
+    {
+        if (r < 0 || r > 2) return NULL;
+        ILuaInterface* l = g_realm[r];
+        if (!Lua::IfaceLive(l)) return NULL;
+        void* st = (void*)l->GetState();
+        if (!st || !Mem::IsReadable(st, sizeof(void*))) return NULL;
+        if (g_apiState[r] && st != g_apiState[r]) return NULL;
+        return l;
+    }
+
+    static bool RealmTableOwned()
+    {
+        #if defined(CC_WINDOWS)
+            return g_gameThreadId == 0 || Platform::IsGameThread();
+        #else
+            return g_gameThreadTid == 0 || Platform::IsGameThread();
+        #endif
+    }
+
     void* Lua::Iface(int realm)
     {
         if (realm < 0 || realm > 2) return NULL;
         if (g_shared) return (void*)g_shared->GetLuaInterface((unsigned char)realm);
         ILuaInterface* l = g_realm[realm];
-        return (l && Mem::IsReadable(l, 2 * sizeof(void*))) ? (void*)l : NULL;
+        return Lua::IfaceLive(l) ? (void*)l : NULL;
     }
 
     // Handle to the loaded lua_shared for symbol lookup. Resolved at arm time.
@@ -230,7 +295,7 @@ namespace CrashCapture {
 
     static int RealmOf(ILuaInterface* iface)
     {
-        if (!iface) return -1;
+        if (!Lua::IfaceLive(iface)) return -1;
         // IsServer/IsClient/IsMenu are trivial getters; safe to call at bind time.
         if (iface->IsMenu()) return LuaState::MENU;
         if (iface->IsServer()) return LuaState::SERVER;
@@ -244,7 +309,9 @@ namespace CrashCapture {
     {
         ILuaInterface* l = (ILuaInterface*)iface;
         int r = RealmOf(l);
-        if (r >= 0) g_realm[r] = l;
+        if (r < 0) return;
+        if (g_realm[r] && g_realm[r] != l) ClearRealm(r);
+        g_realm[r] = l;
         Lua::InstallApi(iface);
         Lua::InstallHeartbeat(iface);
     }
@@ -252,14 +319,7 @@ namespace CrashCapture {
     void Lua::OnShutdown(void* iface)
     {
         for (int i = 0; i < 3; ++i)
-            if (g_realm[i] == iface) {
-                g_realm[i] = NULL;
-                g_apiState[i] = NULL;
-                g_apiInstalled[i] = false;
-                g_hbInstalled[i] = false;
-                g_readyPending[i] = false;
-                g_readyFired[i] = false;
-            }
+            if (g_realm[i] == iface) ClearRealm(i);
     }
 
     bool Lua::HasBoundRealms()
@@ -281,9 +341,14 @@ namespace CrashCapture {
             CreateInterfaceFn ci = ResolveLuaSharedFactory();
             if (ci) g_shared = (ILuaShared*)ci(GMOD_LUASHARED_INTERFACE, NULL);
         }
-        if (g_shared) {
-            for (int r = 0; r < 3; ++r)
-                if (!g_realm[r]) g_realm[r] = g_shared->GetLuaInterface((unsigned char)r);
+        if (!g_shared || !RealmTableOwned()) return;
+
+        for (int r = 0; r < 3; ++r) {
+            ILuaInterface* cur = g_shared->GetLuaInterface((unsigned char)r);
+            ILuaInterface* have = g_realm[r];
+            if (cur && cur == have) continue;
+            if (have && (cur || !Lua::IfaceLive(have))) ClearRealm(r);
+            if (!g_realm[r] && Lua::IfaceLive(cur)) g_realm[r] = cur;
         }
     }
 
@@ -403,8 +468,8 @@ namespace CrashCapture {
                 g_apiDiag ? g_apiDiag : "?");
             return;
         }
-        if (!Mem::IsReadable(l, 2 * sizeof(void*))) {
-            Log::Str("\n_interface not readable; skipping stack walk._\n");
+        if (!Lua::IfaceLive(l)) {
+            Log::Str("\n_interface vtable is not a live lua_shared vtable._\n");
             return;
         }
         lua_State* L = l->GetState();
@@ -509,10 +574,9 @@ namespace CrashCapture {
         int rc = 0;
         const int maxFrames = (int)(sizeof(out[0].frames) / sizeof(out[0].frames[0]));
         for (int r = 0; r < 3 && rc < maxRealms; ++r) {
-            ILuaInterface* l = g_realm[r];
-            if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) continue;
+            ILuaInterface* l = LiveRealm(r);
+            if (!l) continue;
             lua_State* L = l->GetState();
-            if (!L || !Mem::IsReadable(L, sizeof(void*))) continue;
 
             CCLuaTrace* t = &out[rc];
             memset(t, 0, sizeof(*t));
@@ -658,10 +722,8 @@ namespace CrashCapture {
         Lua::RefreshStates();
         int fired = 0;
         for (int r = 0; r < 3; ++r) {
-            ILuaInterface* l = g_realm[r];
-            if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) continue;
-            void* L = (void*)l->GetState();
-            if (!L || !Mem::IsReadable(L, sizeof(void*))) continue;
+            ILuaInterface* l = LiveRealm(r);
+            if (!l) continue;
             if (px) ++fired;
             if (lb) FireRecoveryHook(l, "crashcapture.loopbreak", info);
             if (pr) FireRecoveryHook(l, "crashcapture.physresume", info);
@@ -711,10 +773,9 @@ namespace CrashCapture {
         Lua::RefreshStates();
         for (int r = 0; r < 3; ++r) {
             if (!g_readyPending[r]) continue;
-            ILuaInterface* l = g_realm[r];
-            if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) continue;
-            void* L = (void*)l->GetState();
-            if (!L || !Mem::IsReadable(L, sizeof(void*))) continue;
+            if (!g_apiState[r]) continue;
+            ILuaInterface* l = LiveRealm(r);
+            if (!l) continue;
             if (FireReadyHook(l, r)) {
                 g_readyPending[r] = false;
                 g_readyFired[r] = true;
@@ -726,11 +787,9 @@ namespace CrashCapture {
     {
         if (!g_api.sethook) return;
         for (int r = 0; r < 3; ++r) {
-            ILuaInterface* l = g_realm[r];
-            if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) continue;
-            lua_State* L = l->GetState();
-            if (!L || !Mem::IsReadable(L, sizeof(void*))) continue;
-            g_api.sethook(L, NULL, 0, 0);
+            ILuaInterface* l = LiveRealm(r);
+            if (!l) continue;
+            g_api.sethook(l->GetState(), NULL, 0, 0);
         }
     }
 
@@ -759,11 +818,9 @@ namespace CrashCapture {
         int armed = 0;
         for (int r = 0; r < 3; ++r) {
             if (r == LuaState::MENU) continue;
-            ILuaInterface* l = g_realm[r];
-            if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) continue;
-            lua_State* L = l->GetState();
-            if (!L || !Mem::IsReadable(L, sizeof(void*))) continue;
-            g_api.sethook(L, cc_break_hook, CC_LUA_MASKCOUNT, 1);
+            ILuaInterface* l = LiveRealm(r);
+            if (!l) continue;
+            g_api.sethook(l->GetState(), cc_break_hook, CC_LUA_MASKCOUNT, 1);
             ++armed;
         }
         return armed;
@@ -788,6 +845,11 @@ namespace CrashCapture {
         }
 
         // fallback if request break doesn't work...
+        if (!Platform::IsGameThread()) {
+            Log::Str("[Crash Capture] loop-break: could not reach the game thread; "
+                     "refusing to arm the hook from the watchdog.\n");
+            return false;
+        }
         int armed = Lua::ArmBreakHook();
         if (armed)
             Log::F("[Crash Capture] loop-break: armed count hook on %d realm(s).\n", armed);
@@ -810,7 +872,7 @@ namespace CrashCapture {
         if (!Cfg().lua_heartbeat) return;
 
         ILuaInterface* L = (ILuaInterface*)iface;
-        if (!L) return;
+        if (!Lua::IfaceLive(L)) return;
 
         int r = RealmOf(L);
         if (r >= 0) {
@@ -838,8 +900,12 @@ namespace CrashCapture {
     void Lua::InstallHeartbeatAll()
     {
         Lua::RefreshStates();
-        for (int r = 0; r < 3; ++r)
-            if (g_realm[r]) { Lua::InstallApi(g_realm[r]); Lua::InstallHeartbeat(g_realm[r]); }
+        for (int r = 0; r < 3; ++r) {
+            ILuaInterface* l = LiveRealm(r);
+            if (!l) continue;
+            Lua::InstallApi(l);
+            Lua::InstallHeartbeat(l);
+        }
     }
 
     // --------- lua-api ---
@@ -1033,7 +1099,7 @@ namespace CrashCapture {
     static ILuaInterface* IfaceForState(lua_State* L)
     {
         for (int r = 0; r < 3; ++r)
-            if (g_apiState[r] && g_apiState[r] == (void*)L) return g_realm[r];
+            if (g_apiState[r] && g_apiState[r] == (void*)L) return LiveRealm(r);
         return NULL;
     }
 
@@ -1489,7 +1555,7 @@ namespace CrashCapture {
     void Lua::InstallApi(void* iface)
     {
         ILuaInterface* L = (ILuaInterface*)iface;
-        if (!L) return;
+        if (!Lua::IfaceLive(L)) return;
 
         int r = RealmOf(L);
         if (r >= 0) {
@@ -1532,24 +1598,17 @@ namespace CrashCapture {
     bool Lua::EnsureApi()
     {
         Lua::RefreshStates();
-        if (!g_shared) return false;
+        if (!g_shared || !RealmTableOwned()) return false;
 
         bool serverReady = false;
         for (int r = 0; r < 3; ++r) {
             ILuaInterface* l = g_shared->GetLuaInterface((unsigned char)r);
-            if (!l || !Mem::IsReadable(l, 2 * sizeof(void*))) {
-                g_realm[r] = NULL;
-                g_apiState[r] = NULL;
-                g_apiInstalled[r] = false;
-                g_hbInstalled[r] = false;
-                g_readyPending[r] = false;
-                g_readyFired[r] = false;
-                continue;
-            }
+            if (!Lua::IfaceLive(l)) { ClearRealm(r); continue; }
+
+            if (l != g_realm[r]) { ClearRealm(r); g_realm[r] = l; }
 
             void* st = (void*)l->GetState();
-            if (st && (l != g_realm[r] || st != g_apiState[r])) {
-                g_realm[r] = l;
+            if (st && st != g_apiState[r]) {
                 g_apiState[r] = st;
                 g_apiInstalled[r] = false;
                 g_hbInstalled[r] = false;

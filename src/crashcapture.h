@@ -170,6 +170,7 @@ namespace CrashCapture {
         void OnShutdown(void* iface);
         void MarkModuleLoad();
         bool HasBoundRealms();
+        bool IfaceLive(void* iface);
         void RefreshStates();
         void Dump();
         bool BreakLoop(const char* msg);

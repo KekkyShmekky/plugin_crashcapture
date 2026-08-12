@@ -292,7 +292,7 @@ namespace CrashCapture {
         if (idx < (unsigned)kPooledCache && g_pooled[idx] >= 0) return g_pooled[idx];
 
         const char* name = NULL;
-        if (l) {
+        if (l && Lua::IfaceLive(l)) {
             const char* s = l->GetPooledString((int)idx);
             if (s && Mem::IsReadable(s, 1)) name = s;
         }
